@@ -2,13 +2,23 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { randomBytes } = require("crypto");
 const { promisify } = require("util");
+const { transport, makeANiceEmail } = require("../mail");
+const { hasPermission } = require("../utils");
 
 const Mutations = {
   async createItem(parent, args, ctx, info) {
-    // TODO Create an item
+    if (!ctx.request.userId) {
+      throw new Error("You must be logged in to do that!");
+    }
+
     const item = await ctx.db.mutation.createItem(
       {
         data: {
+          user: {
+            connect: {
+              id: ctx.request.userId
+            }
+          },
           ...args
         }
       },
@@ -34,11 +44,22 @@ const Mutations = {
     );
   },
   async deleteItem(parent, args, ctx, info) {
+    // check if they are lgoged in
+    if (!ctx.request.userId) {
+      throw new Error("You must be logged in!");
+    }
+
     const where = { id: args.id };
     // find the item
-    const item = await ctx.db.query.item({ where }, `{ id title }`);
+    const item = await ctx.db.query.item({ where }, `{ id title user { id } }`);
     // check if they own that item or have permissions
-    // todo
+    const ownsItem = item.user.id === ctx.request.userId;
+    const hasPermissions = ctx.request.user.permissions.some(permission =>
+      ["ADMIN", "ITEMDELETE"].includes(permission)
+    );
+    if (!ownsItem && !hasPermissions) {
+      throw new Error("You don't have permission to do this.");
+    }
     // delete it!
     return ctx.db.mutation.deleteItem({ where }, info);
   },
@@ -109,8 +130,21 @@ const Mutations = {
       where: { email: args.email },
       data: { resetToken, resetTokenExpiry }
     });
-    console.log(res);
     // email them that reset token
+    const mailRes = await transport.sendMail({
+      from: "support@sickfits.com",
+      to: user.email,
+      subject: "Your password reset token",
+      html: makeANiceEmail(`Your Password Reset Token is here!
+      \n\n
+      <a 
+      href="${process.env.FRONTEND_URL}/reset?resetToken=${resetToken}">
+      Click here to Reset</a>
+      `)
+    });
+
+    // return a message
+    return { message: "Thanks!" };
   },
   async resetPassword(
     parent,
@@ -153,6 +187,77 @@ const Mutations = {
     });
     // return the user
     return saveUser;
+  },
+  async updatePermissions(parent, args, ctx, info) {
+    // check if they are lgoged in
+    if (!ctx.request.userId) {
+      throw new Error("You must be logged in!");
+    }
+    // query current user
+    const currentUser = await ctx.db.query.user(
+      {
+        where: {
+          id: ctx.request.userId
+        }
+      },
+      info
+    );
+    console.log("hello", currentUser);
+    // check if they have permission
+    hasPermission(currentUser, ["ADMIN", "PERMISSIONUPDATE"]);
+    // update permissions
+    return ctx.db.mutation.updateUser(
+      {
+        data: {
+          permissions: {
+            set: args.permissions
+          }
+        },
+        where: {
+          id: args.userId
+        }
+      },
+      info
+    );
+  },
+  async addToCart(parent, args, ctx, info) {
+    // Make sure they are signed in
+    const { userId } = ctx.request;
+    if (!userId) {
+      throw new Error("You must be logged in!");
+    }
+    // Query the users current cart
+    const [existingCartItem] = await ctx.db.query.cartItems({
+      where: {
+        user: { id: userId },
+        item: { id: args.id }
+      }
+    });
+    // Check if that item is already in their cart and increment by 1
+    if (existingCartItem) {
+      console.log("Item is already in their cart!");
+      return ctx.db.mutation.updateCartItem(
+        {
+          where: { id: existingCartItem.id },
+          data: { quantity: existingCartItem.quantity + 1 }
+        },
+        info
+      );
+    }
+    // if it isn't, create a fresh CartItem for that user.
+    return ctx.db.mutation.createCartItem(
+      {
+        data: {
+          user: {
+            connect: { id: userId }
+          },
+          item: {
+            connect: { id: args.id }
+          }
+        }
+      },
+      info
+    );
   }
 };
 
